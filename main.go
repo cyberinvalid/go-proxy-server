@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -12,30 +13,32 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
 // ResponseOverride конфигурация для подмены ответа
 type ResponseOverride struct {
-	Name           string            `json:"name"`             // Имя правила для логов
-	Method         string            `json:"method"`           // HTTP метод (* для любого)
-	URLPattern     string            `json:"url_pattern"`      // Паттерн URL (поддерживает regex)
-	IsRegex        bool              `json:"is_regex"`         // Использовать regex для паттерна
-	StatusCode     int               `json:"status_code"`      // HTTP статус код
-	Headers        map[string]string `json:"headers"`          // Заголовки ответа
-	BodyFile       string            `json:"body_file"`        // Путь к файлу с телом ответа
-	BodyText       string            `json:"body_text"`        // Текст ответа (альтернатива файлу)
-	Enabled        bool              `json:"enabled"`          // Включено ли правило
-	TriggerAfter   int               `json:"trigger_after"`    // После скольких запросов срабатывать (0 = сразу)
-	MaxTriggers    int               `json:"max_triggers"`     // Максимальное количество срабатываний (-1 = бесконечно)
-	ResetAfter     int               `json:"reset_after"`      // Сброс счетчика через N запросов (0 = не сбрасывать)
-	compiledRegex  *regexp.Regexp    // Скомпилированный regex (не сериализуется)
-	requestCount   int               // Счетчик запросов (не сериализуется)
-	triggerCount   int               // Счетчик срабатываний (не сериализуется)
-	mutex          sync.Mutex        // Мьютекс для безопасности (не сериализуется)
+	Name          string            `json:"name"`          // Имя правила для логов
+	Method        string            `json:"method"`        // HTTP метод (* для любого)
+	URLPattern    string            `json:"url_pattern"`   // Паттерн URL (поддерживает regex)
+	IsRegex       bool              `json:"is_regex"`      // Использовать regex для паттерна
+	StatusCode    int               `json:"status_code"`   // HTTP статус код
+	Headers       map[string]string `json:"headers"`       // Заголовки ответа
+	BodyFile      string            `json:"body_file"`     // Путь к файлу с телом ответа
+	BodyText      string            `json:"body_text"`     // Текст ответа (альтернатива файлу)
+	Enabled       bool              `json:"enabled"`       // Включено ли правило
+	TriggerAfter  int               `json:"trigger_after"` // После скольких запросов срабатывать (0 = сразу)
+	MaxTriggers   int               `json:"max_triggers"`  // Максимальное количество срабатываний (-1 = бесконечно)
+	ResetAfter    int               `json:"reset_after"`   // Сброс счетчика через N запросов (0 = не сбрасывать)
+	compiledRegex *regexp.Regexp    // Скомпилированный regex (не сериализуется)
+	requestCount  int               // Счетчик запросов (не сериализуется)
+	triggerCount  int               // Счетчик срабатываний (не сериализуется)
+	mutex         sync.Mutex        // Мьютекс для безопасности (не сериализуется)
 }
 
 // Config конфигурация всех подмен
@@ -45,14 +48,28 @@ type Config struct {
 
 // LogSettings настройки логирования
 type LogSettings struct {
-	ShowRequestBody  bool
-	ShowResponseBody bool
-	BodyLogMode      string // "full", "truncate", "none", "json_full"
-	MaxLogLength     int
+	ShowRequestBody     bool
+	ShowResponseBody    bool
+	ShowRequestHeaders  bool
+	ShowResponseHeaders bool
+	BodyLogMode         string // "full", "truncate", "none", "json_full"
+	MaxLogLength        int
+}
+
+// ProxySettings настройки прокси
+type ProxySettings struct {
+	Enabled       bool
+	URL           string
+	Username      string
+	Password      string
+	SkipTLSVerify bool
+	Timeout       time.Duration
 }
 
 var config Config
 var logSettings LogSettings
+var proxySettings ProxySettings
+var httpClient *http.Client
 
 func main() {
 	// Получаем целевой хост из переменной окружения
@@ -69,6 +86,12 @@ func main() {
 
 	// Настраиваем логирование
 	setupLogSettings()
+
+	// Настраиваем прокси
+	setupProxySettings()
+
+	// Создаем HTTP клиент с настройками прокси
+	setupHTTPClient()
 
 	// Загружаем конфигурацию подмен
 	configFile := os.Getenv("OVERRIDE_CONFIG")
@@ -99,6 +122,7 @@ func main() {
 	log.Printf("Активных правил подмены: %d", countActiveOverrides())
 	log.Printf("Статистика доступна на: http://127.0.0.1:%s/_proxy_stats", port)
 	printLogSettings()
+	printProxySettings()
 
 	if targetURL.Path != "" && targetURL.Path != "/" {
 		log.Printf("Базовый path: %s", targetURL.Path)
@@ -115,7 +139,11 @@ func setupLogSettings() {
 	// Настройки логирования body
 	logSettings.ShowRequestBody = os.Getenv("LOG_REQUEST_BODY") != "false"
 	logSettings.ShowResponseBody = os.Getenv("LOG_RESPONSE_BODY") != "false"
-	
+
+	// Настройки логирования headers
+	logSettings.ShowRequestHeaders = os.Getenv("LOG_REQUEST_HEADERS") != "false"
+	logSettings.ShowResponseHeaders = os.Getenv("LOG_RESPONSE_HEADERS") != "false"
+
 	// Режим логирования body
 	logSettings.BodyLogMode = strings.ToLower(os.Getenv("BODY_LOG_MODE"))
 	if logSettings.BodyLogMode == "" {
@@ -131,10 +159,67 @@ func setupLogSettings() {
 	}
 }
 
+func setupProxySettings() {
+	proxyURL := os.Getenv("UPSTREAM_PROXY")
+	if proxyURL == "" {
+		proxySettings.Enabled = false
+		return
+	}
+
+	proxySettings.Enabled = true
+	proxySettings.URL = proxyURL
+	proxySettings.Username = os.Getenv("UPSTREAM_PROXY_USERNAME")
+	proxySettings.Password = os.Getenv("UPSTREAM_PROXY_PASSWORD")
+	proxySettings.SkipTLSVerify = os.Getenv("UPSTREAM_PROXY_SKIP_TLS") == "true"
+
+	// Настройка таймаута
+	timeoutStr := os.Getenv("UPSTREAM_PROXY_TIMEOUT")
+	if timeoutStr != "" {
+		if timeout, err := time.ParseDuration(timeoutStr); err == nil {
+			proxySettings.Timeout = timeout
+		} else {
+			log.Printf("⚠️  Неверный формат UPSTREAM_PROXY_TIMEOUT: %s, используется 30s", timeoutStr)
+			proxySettings.Timeout = 30 * time.Second
+		}
+	} else {
+		proxySettings.Timeout = 30 * time.Second
+	}
+}
+
+func setupHTTPClient() {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: proxySettings.SkipTLSVerify,
+		},
+	}
+
+	if proxySettings.Enabled {
+		proxyURL, err := url.Parse(proxySettings.URL)
+		if err != nil {
+			log.Fatalf("❌ Ошибка парсинга URL прокси: %v", err)
+		}
+
+		// Добавляем аутентификацию если указана
+		if proxySettings.Username != "" {
+			proxyURL.User = url.UserPassword(proxySettings.Username, proxySettings.Password)
+		}
+
+		transport.Proxy = http.ProxyURL(proxyURL)
+		log.Printf("🔗 Настроен upstream прокси: %s", proxySettings.URL)
+	}
+
+	httpClient = &http.Client{
+		Transport: transport,
+		Timeout:   proxySettings.Timeout,
+	}
+}
+
 func printLogSettings() {
 	log.Printf("📋 Настройки логирования:")
 	log.Printf("   Request Body: %v", logSettings.ShowRequestBody)
 	log.Printf("   Response Body: %v", logSettings.ShowResponseBody)
+	log.Printf("   Request Headers: %v", logSettings.ShowRequestHeaders)
+	log.Printf("   Response Headers: %v", logSettings.ShowResponseHeaders)
 	log.Printf("   Body Log Mode: %s", logSettings.BodyLogMode)
 	if logSettings.BodyLogMode == "truncate" {
 		log.Printf("   Max Log Length: %d", logSettings.MaxLogLength)
@@ -145,6 +230,35 @@ func printLogSettings() {
 	log.Printf("   - 'truncate' - обрезать длинные body")
 	log.Printf("   - 'json_full' - JSON полностью, остальное обрезать (по умолчанию)")
 	log.Printf("   - 'none' - не показывать body")
+	log.Printf("")
+	log.Printf("🎛️  Настройки заголовков:")
+	log.Printf("   - LOG_REQUEST_HEADERS=false - отключить заголовки запроса")
+	log.Printf("   - LOG_RESPONSE_HEADERS=false - отключить заголовки ответа")
+	log.Printf("")
+}
+
+func printProxySettings() {
+	log.Printf("🌐 Настройки upstream прокси:")
+	if proxySettings.Enabled {
+		log.Printf("   Enabled: ✅")
+		log.Printf("   URL: %s", proxySettings.URL)
+		if proxySettings.Username != "" {
+			log.Printf("   Auth: %s:***", proxySettings.Username)
+		} else {
+			log.Printf("   Auth: не используется")
+		}
+		log.Printf("   Skip TLS Verify: %v", proxySettings.SkipTLSVerify)
+		log.Printf("   Timeout: %v", proxySettings.Timeout)
+	} else {
+		log.Printf("   Enabled: ❌")
+	}
+	log.Printf("")
+	log.Printf("🔧 Переменные окружения для прокси:")
+	log.Printf("   - UPSTREAM_PROXY=http://proxy.example.com:8080")
+	log.Printf("   - UPSTREAM_PROXY_USERNAME=username")
+	log.Printf("   - UPSTREAM_PROXY_PASSWORD=password")
+	log.Printf("   - UPSTREAM_PROXY_SKIP_TLS=true")
+	log.Printf("   - UPSTREAM_PROXY_TIMEOUT=30s")
 	log.Printf("")
 }
 
@@ -190,14 +304,14 @@ func createExampleConfig(configFile string) {
 	exampleConfig := Config{
 		Overrides: []ResponseOverride{
 			{
-				Name:        "Yandex bindings - срабатывает после 3 запросов",
-				Method:      "*",
-				URLPattern:  "/bindings",
-				IsRegex:     false,
-				StatusCode:  200,
+				Name:         "Yandex bindings - срабатывает после 3 запросов",
+				Method:       "*",
+				URLPattern:   "/bindings",
+				IsRegex:      false,
+				StatusCode:   200,
 				TriggerAfter: 3,
-				MaxTriggers: 2,
-				ResetAfter:  10,
+				MaxTriggers:  2,
+				ResetAfter:   10,
 				Headers: map[string]string{
 					"Content-Type": "application/json",
 					"X-Custom":     "overridden-after-3-requests",
@@ -206,13 +320,13 @@ func createExampleConfig(configFile string) {
 				Enabled:  true,
 			},
 			{
-				Name:        "API users - мгновенная подмена",
-				Method:      "GET",
-				URLPattern:  `/api/users/\d+`,
-				IsRegex:     true,
-				StatusCode:  200,
-				TriggerAfter: 0, // срабатывает сразу
-				MaxTriggers: -1, // бесконечно
+				Name:         "API users - мгновенная подмена",
+				Method:       "GET",
+				URLPattern:   `/api/users/\d+`,
+				IsRegex:      true,
+				StatusCode:   200,
+				TriggerAfter: 0,  // срабатывает сразу
+				MaxTriggers:  -1, // бесконечно
 				Headers: map[string]string{
 					"Content-Type": "application/json",
 				},
@@ -220,13 +334,13 @@ func createExampleConfig(configFile string) {
 				Enabled:  false,
 			},
 			{
-				Name:        "Error simulation - после 5 запросов",
-				Method:      "POST",
-				URLPattern:  "/api/submit",
-				IsRegex:     false,
-				StatusCode:  500,
+				Name:         "Error simulation - после 5 запросов",
+				Method:       "POST",
+				URLPattern:   "/api/submit",
+				IsRegex:      false,
+				StatusCode:   500,
 				TriggerAfter: 5,
-				MaxTriggers: 1, // только один раз
+				MaxTriggers:  1, // только один раз
 				Headers: map[string]string{
 					"Content-Type": "application/json",
 				},
@@ -242,10 +356,10 @@ func createExampleConfig(configFile string) {
 		log.Printf("⚠️  Не удалось создать пример конфигурации: %v", err)
 	} else {
 		log.Printf("📝 Создан пример конфигурации: %s", configFile)
-		
+
 		// Создаем директорию для файлов ответов
 		os.MkdirAll("responses", 0755)
-		
+
 		// Создаем пример файла ответа
 		exampleResponse := map[string]interface{}{
 			"status": "success",
@@ -257,7 +371,7 @@ func createExampleConfig(configFile string) {
 				},
 				"total": 3,
 			},
-			"message": "This is a mocked response from file (triggered after N requests)",
+			"message":      "This is a mocked response from file (triggered after N requests)",
 			"triggered_at": "auto-generated",
 		}
 		responseData, _ := json.MarshalIndent(exampleResponse, "", "  ")
@@ -299,10 +413,10 @@ func findMatchingOverride(method, urlPath string) *ResponseOverride {
 		if matches {
 			override.mutex.Lock()
 			override.requestCount++
-			
+
 			// Проверяем, нужно ли сбросить счетчики
 			if override.ResetAfter > 0 && override.requestCount >= override.ResetAfter {
-				log.Printf("🔄 Сброс счетчиков для правила '%s' (достигнуто %d запросов)", 
+				log.Printf("🔄 Сброс счетчиков для правила '%s' (достигнуто %d запросов)",
 					override.Name, override.ResetAfter)
 				override.requestCount = 0
 				override.triggerCount = 0
@@ -320,12 +434,12 @@ func findMatchingOverride(method, urlPath string) *ResponseOverride {
 
 			if shouldTrigger {
 				override.triggerCount++
-				log.Printf("📊 Правило '%s': запрос %d, срабатывание %d", 
+				log.Printf("📊 Правило '%s': запрос %d, срабатывание %d",
 					override.Name, override.requestCount, override.triggerCount)
 				override.mutex.Unlock()
 				return override
 			} else {
-				log.Printf("📊 Правило '%s': запрос %d (нужно %d для срабатывания)", 
+				log.Printf("📊 Правило '%s': запрос %d (нужно %d для срабатывания)",
 					override.Name, override.requestCount, override.TriggerAfter+1)
 				override.mutex.Unlock()
 			}
@@ -336,9 +450,9 @@ func findMatchingOverride(method, urlPath string) *ResponseOverride {
 
 func showStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	
+
 	stats := make([]map[string]interface{}, 0, len(config.Overrides))
-	
+
 	for _, override := range config.Overrides {
 		override.mutex.Lock()
 		stat := map[string]interface{}{
@@ -355,19 +469,28 @@ func showStats(w http.ResponseWriter, r *http.Request) {
 		override.mutex.Unlock()
 		stats = append(stats, stat)
 	}
-	
+
 	response := map[string]interface{}{
-		"overrides": stats,
-		"total_rules": len(config.Overrides),
+		"overrides":    stats,
+		"total_rules":  len(config.Overrides),
 		"active_rules": countActiveOverrides(),
 		"log_settings": map[string]interface{}{
-			"show_request_body":  logSettings.ShowRequestBody,
-			"show_response_body": logSettings.ShowResponseBody,
-			"body_log_mode":      logSettings.BodyLogMode,
-			"max_log_length":     logSettings.MaxLogLength,
+			"show_request_body":     logSettings.ShowRequestBody,
+			"show_response_body":    logSettings.ShowResponseBody,
+			"show_request_headers":  logSettings.ShowRequestHeaders,
+			"show_response_headers": logSettings.ShowResponseHeaders,
+			"body_log_mode":         logSettings.BodyLogMode,
+			"max_log_length":        logSettings.MaxLogLength,
+		},
+		"proxy_settings": map[string]interface{}{
+			"enabled":         proxySettings.Enabled,
+			"url":             proxySettings.URL,
+			"has_auth":        proxySettings.Username != "",
+			"skip_tls_verify": proxySettings.SkipTLSVerify,
+			"timeout":         proxySettings.Timeout.String(),
 		},
 	}
-	
+
 	json.NewEncoder(w).Encode(response)
 }
 
@@ -379,7 +502,7 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 
 	// Объединяем базовый path из targetURL с path из запроса
 	combinedPath := path.Join(targetURL.Path, r.URL.Path)
-	
+
 	// path.Join убирает trailing slash, восстанавливаем если нужно
 	if strings.HasSuffix(r.URL.Path, "/") && !strings.HasSuffix(combinedPath, "/") {
 		combinedPath += "/"
@@ -393,7 +516,16 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 		RawQuery: r.URL.RawQuery,
 	}
 
-	log.Printf("🔄 %s %s -> %s", r.Method, r.URL.String(), proxyURL.String())
+	proxyInfo := proxyURL.String()
+	if proxySettings.Enabled {
+		proxyInfo += " (via " + proxySettings.URL + ")"
+	}
+	log.Printf("🔄 %s %s -> %s", r.Method, r.URL.String(), proxyInfo)
+
+	// Логируем заголовки входящего запроса
+	if logSettings.ShowRequestHeaders {
+		logHeaders("📤 Request Headers", r.Header)
+	}
 
 	// Проверяем, есть ли подмена для этого запроса
 	if override := findMatchingOverride(r.Method, r.URL.Path); override != nil {
@@ -407,7 +539,7 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 	if r.Body != nil {
 		requestBody, _ = io.ReadAll(r.Body)
 		r.Body = io.NopCloser(bytes.NewBuffer(requestBody))
-		
+
 		if len(requestBody) > 0 && logSettings.ShowRequestBody {
 			logBody("📤 Request Body", requestBody, r.Header.Get("Content-Type"), r.Header)
 		}
@@ -427,9 +559,8 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 	// Устанавливаем правильный Host заголовок
 	proxyReq.Host = targetURL.Host
 
-	// Выполняем запрос
-	client := &http.Client{}
-	resp, err := client.Do(proxyReq)
+	// Выполняем запрос через настроенный клиент (с прокси если настроен)
+	resp, err := httpClient.Do(proxyReq)
 	if err != nil {
 		http.Error(w, "Ошибка выполнения запроса", http.StatusBadGateway)
 		log.Printf("❌ Ошибка выполнения запроса: %v", err)
@@ -445,22 +576,17 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 		return
 	}
 
-	// Логируем статус и заголовки ответа
+	// Логируем статус ответа
 	log.Printf("📥 Response Status: %d %s", resp.StatusCode, resp.Status)
-	
-	contentType := resp.Header.Get("Content-Type")
-	contentEncoding := resp.Header.Get("Content-Encoding")
-	
-	if contentType != "" {
-		log.Printf("📥 Response Content-Type: %s", contentType)
-	}
-	if contentEncoding != "" {
-		log.Printf("📥 Response Content-Encoding: %s", contentEncoding)
+
+	// Логируем заголовки ответа
+	if logSettings.ShowResponseHeaders {
+		logHeaders("📥 Response Headers", resp.Header)
 	}
 
 	// Логируем тело ответа
 	if len(responseBody) > 0 && logSettings.ShowResponseBody {
-		logBody("📥 Response Body", responseBody, contentType, resp.Header)
+		logBody("📥 Response Body", responseBody, resp.Header.Get("Content-Type"), resp.Header)
 	}
 
 	// Копируем заголовки ответа
@@ -522,14 +648,51 @@ func handleOverride(w http.ResponseWriter, r *http.Request, override *ResponseOv
 	// Логируем подменный ответ
 	log.Printf("🎭 Отправлен подменный ответ:")
 	log.Printf("   Status: %d", override.StatusCode)
-	log.Printf("   Headers: %v", override.Headers)
-	
+
+	// Логируем заголовки подмены
+	if logSettings.ShowResponseHeaders && len(override.Headers) > 0 {
+		log.Printf("   Override Headers:")
+		headers := make([]string, 0, len(override.Headers))
+		for key, _ := range override.Headers {
+			headers = append(headers, key)
+		}
+		sort.Strings(headers)
+		for _, key := range headers {
+			log.Printf("     %s: %s", key, override.Headers[key])
+		}
+	}
+
 	if len(responseBody) > 0 && logSettings.ShowResponseBody {
 		contentType := override.Headers["Content-Type"]
 		logBody("   Body", responseBody, contentType, nil)
 	}
 
 	log.Printf("✅ Подмена завершена\n")
+}
+
+// logHeaders логирует HTTP заголовки
+func logHeaders(prefix string, headers http.Header) {
+	if len(headers) == 0 {
+		log.Printf("%s: [None]", prefix)
+		return
+	}
+
+	// Сортируем заголовки для консистентного вывода
+	keys := make([]string, 0, len(headers))
+	for key := range headers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	log.Printf("%s:", prefix)
+	for _, key := range keys {
+		values := headers[key]
+		if len(values) == 1 {
+			log.Printf("  %s: %s", key, values[0])
+		} else {
+			log.Printf("  %s: %v", key, values)
+		}
+	}
 }
 
 // logBody логирует тело запроса/ответа с учетом настроек
@@ -567,7 +730,7 @@ func logBodyFull(prefix string, body []byte, contentType string, headers http.He
 	}
 
 	decompressedBody := decompressIfNeeded(body, headers)
-	
+
 	if utf8.Valid(decompressedBody) {
 		log.Printf("%s: %s", prefix, string(decompressedBody))
 	} else {
@@ -579,7 +742,7 @@ func logBodyFull(prefix string, body []byte, contentType string, headers http.He
 // logBodyTruncated показывает body с обрезанием
 func logBodyTruncated(prefix string, body []byte, contentType string, headers http.Header) {
 	decompressedBody := decompressIfNeeded(body, headers)
-	
+
 	if utf8.Valid(decompressedBody) {
 		text := string(decompressedBody)
 		log.Printf("%s: %s", prefix, truncateString(text, logSettings.MaxLogLength))
@@ -592,7 +755,7 @@ func logBodyTruncated(prefix string, body []byte, contentType string, headers ht
 // logBodyJSONSmart показывает JSON полностью, остальное обрезает
 func logBodyJSONSmart(prefix string, body []byte, contentType string, headers http.Header) {
 	decompressedBody := decompressIfNeeded(body, headers)
-	
+
 	// Проверяем, является ли контент JSON
 	if isJSONContent(contentType, decompressedBody) {
 		// Для JSON форматируем и выводим полностью
@@ -643,7 +806,7 @@ func decompressIfNeeded(body []byte, headers http.Header) []byte {
 			return decompressed
 		}
 	}
-	
+
 	return body
 }
 
@@ -686,7 +849,7 @@ func decompressGzip(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer reader.Close()
-	
+
 	return io.ReadAll(reader)
 }
 
