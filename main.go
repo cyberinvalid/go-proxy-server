@@ -534,30 +534,58 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 		return
 	}
 
-	// Логируем тело входящего запроса
+	// Читаем тело запроса ПОЛНОСТЬЮ
 	var requestBody []byte
-	if r.Body != nil {
-		requestBody, _ = io.ReadAll(r.Body)
-		r.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+	var bodyReader io.Reader
 
+	if r.Body != nil {
+		var err error
+		requestBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Ошибка чтения тела запроса", http.StatusBadRequest)
+			log.Printf("❌ Ошибка чтения тела запроса: %v", err)
+			return
+		}
+		r.Body.Close()
+
+		// Логируем тело входящего запроса
 		if len(requestBody) > 0 && logSettings.ShowRequestBody {
 			logBody("📤 Request Body", requestBody, r.Header.Get("Content-Type"), r.Header)
 		}
+
+		// Создаем новый Reader для прокси запроса
+		bodyReader = bytes.NewReader(requestBody)
 	}
 
 	// Создаем новый HTTP запрос
-	proxyReq, err := http.NewRequest(r.Method, proxyURL.String(), r.Body)
+	proxyReq, err := http.NewRequest(r.Method, proxyURL.String(), bodyReader)
 	if err != nil {
 		http.Error(w, "Ошибка создания запроса", http.StatusInternalServerError)
 		log.Printf("❌ Ошибка создания запроса: %v", err)
 		return
 	}
 
-	// Копируем все заголовки из оригинального запроса
+	// Копируем заголовки из оригинального запроса
 	copyHeaders(proxyReq.Header, r.Header)
 
 	// Устанавливаем правильный Host заголовок
 	proxyReq.Host = targetURL.Host
+
+	// ВАЖНО: Убираем Transfer-Encoding и устанавливаем Content-Length
+	if len(requestBody) > 0 {
+		// Принудительно устанавливаем Content-Length
+		proxyReq.ContentLength = int64(len(requestBody))
+		proxyReq.Header.Set("Content-Length", strconv.Itoa(len(requestBody)))
+
+		// Убираем заголовки, связанные с chunked encoding
+		proxyReq.Header.Del("Transfer-Encoding")
+
+		log.Printf("📏 Content-Length установлен: %d bytes", len(requestBody))
+	} else {
+		// Для запросов без тела также убираем Transfer-Encoding
+		proxyReq.Header.Del("Transfer-Encoding")
+		proxyReq.ContentLength = 0
+	}
 
 	// Выполняем запрос через настроенный клиент (с прокси если настроен)
 	resp, err := httpClient.Do(proxyReq)
@@ -886,7 +914,7 @@ func shouldSkipHeader(name string) bool {
 		"Proxy-Authorization",
 		"Te",
 		"Trailer",
-		"Transfer-Encoding",
+		"Transfer-Encoding", // Добавлено для исключения Transfer-Encoding
 		"Upgrade",
 	}
 
