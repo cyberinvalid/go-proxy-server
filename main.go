@@ -54,6 +54,7 @@ type LogSettings struct {
 	ShowResponseHeaders bool
 	BodyLogMode         string // "full", "truncate", "none", "json_full"
 	MaxLogLength        int
+	EnableStreaming     bool // Включить стриминговый режим (без буферизации)
 }
 
 // ProxySettings настройки прокси
@@ -129,7 +130,7 @@ func main() {
 	}
 
 	// Запускаем сервер
-	err = http.ListenAndServe("127.0.0.1:"+port, nil)
+	err = http.ListenAndServe("0.0.0.0:"+port, nil)
 	if err != nil {
 		log.Fatalf("Ошибка запуска сервера: %v", err)
 	}
@@ -157,6 +158,9 @@ func setupLogSettings() {
 			logSettings.MaxLogLength = parsed
 		}
 	}
+
+	// Настройка стримингового режима
+	logSettings.EnableStreaming = os.Getenv("ENABLE_STREAMING") == "true"
 }
 
 func setupProxySettings() {
@@ -224,6 +228,7 @@ func printLogSettings() {
 	if logSettings.BodyLogMode == "truncate" {
 		log.Printf("   Max Log Length: %d", logSettings.MaxLogLength)
 	}
+	log.Printf("   Streaming Mode: %v", logSettings.EnableStreaming)
 	log.Printf("")
 	log.Printf("💡 Доступные режимы BODY_LOG_MODE:")
 	log.Printf("   - 'full' - показать все body полностью")
@@ -234,6 +239,9 @@ func printLogSettings() {
 	log.Printf("🎛️  Настройки заголовков:")
 	log.Printf("   - LOG_REQUEST_HEADERS=false - отключить заголовки запроса")
 	log.Printf("   - LOG_RESPONSE_HEADERS=false - отключить заголовки ответа")
+	log.Printf("")
+	log.Printf("🚀 Стриминговый режим:")
+	log.Printf("   - ENABLE_STREAMING=true - включить стриминг (отключает логирование body)")
 	log.Printf("")
 }
 
@@ -534,6 +542,17 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 		return
 	}
 
+	// Выбираем режим проксирования
+	if logSettings.EnableStreaming {
+		log.Printf("🚀 Стриминговый режим включен")
+		streamingProxyRequest(w, r, proxyURL, targetURL)
+	} else {
+		bufferedProxyRequest(w, r, proxyURL, targetURL)
+	}
+}
+
+// bufferedProxyRequest - исходный режим с буферизацией для логирования
+func bufferedProxyRequest(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, targetURL *url.URL) {
 	// Читаем тело запроса ПОЛНОСТЬЮ
 	var requestBody []byte
 	var bodyReader io.Reader
@@ -630,6 +649,116 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 	}
 
 	log.Printf("✅ Запрос завершен\n")
+}
+
+// streamingProxyRequest - новый стриминговый режим без буферизации
+func streamingProxyRequest(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, targetURL *url.URL) {
+	// Создаем новый HTTP запрос напрямую с Body из исходного запроса
+	proxyReq, err := http.NewRequest(r.Method, proxyURL.String(), r.Body)
+	if err != nil {
+		http.Error(w, "Ошибка создания запроса", http.StatusInternalServerError)
+		log.Printf("❌ Ошибка создания запроса: %v", err)
+		return
+	}
+
+	// Копируем заголовки из оригинального запроса
+	copyHeaders(proxyReq.Header, r.Header)
+
+	// Устанавливаем правильный Host заголовок
+	proxyReq.Host = targetURL.Host
+
+	// В стриминговом режиме сохраняем исходный ContentLength
+	// Для SSE и chunked encoding это может быть -1
+	proxyReq.ContentLength = r.ContentLength
+
+	if r.ContentLength >= 0 {
+		log.Printf("🚀 Стриминг: Content-Length=%d", r.ContentLength)
+	} else {
+		log.Printf("🚀 Стриминг: chunked encoding или unknown length")
+	}
+
+	// Выполняем запрос через настроенный клиент
+	resp, err := httpClient.Do(proxyReq)
+	if err != nil {
+		http.Error(w, "Ошибка выполнения запроса", http.StatusBadGateway)
+		log.Printf("❌ Ошибка выполнения запроса: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Логируем статус ответа
+	log.Printf("📥 Response Status: %d %s", resp.StatusCode, resp.Status)
+
+	// Логируем заголовки ответа
+	if logSettings.ShowResponseHeaders {
+		logHeaders("📥 Response Headers", resp.Header)
+	}
+
+	// Копируем заголовки ответа ПЕРЕД WriteHeader
+	copyHeaders(w.Header(), resp.Header)
+
+	// Проверяем, является ли это SSE потоком
+	contentType := resp.Header.Get("Content-Type")
+	isSSE := strings.Contains(strings.ToLower(contentType), "text/event-stream")
+
+	if isSSE {
+		log.Printf("🌊 Обнаружен SSE поток (text/event-stream)")
+		// Для SSE принудительно устанавливаем важные заголовки
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		// Убираем Content-Length для SSE потоков
+		w.Header().Del("Content-Length")
+	}
+
+	// Устанавливаем статус код
+	w.WriteHeader(resp.StatusCode)
+
+	// Получаем Flusher для немедленной отправки данных (важно для SSE)
+	flusher, canFlush := w.(http.Flusher)
+	if !canFlush {
+		log.Printf("⚠️  ResponseWriter не поддерживает Flush")
+	}
+
+	// СТРИМИНГ: копируем с поддержкой Flush для SSE
+	if isSSE && canFlush {
+		// Для SSE используем буферизованное копирование с Flush
+		bytesWritten := streamWithFlush(w, resp.Body, flusher)
+		log.Printf("🌊 SSE стриминг завершен: %d bytes передано", bytesWritten)
+	} else {
+		// Обычный стриминг
+		bytesWritten, err := io.Copy(w, resp.Body)
+		if err != nil {
+			log.Printf("❌ Ошибка стриминга ответа: %v", err)
+			return
+		}
+		log.Printf("🚀 Стриминг завершен: %d bytes передано", bytesWritten)
+	}
+
+	log.Printf("✅ Запрос завершен\n")
+}
+
+// streamWithFlush - стриминг с принудительной отправкой для SSE
+func streamWithFlush(w io.Writer, src io.Reader, flusher http.Flusher) int64 {
+	buf := make([]byte, 4096) // Небольшой буфер для частой отправки
+	var written int64
+
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+			written += int64(n)
+			// Немедленно отправляем данные клиенту (критично для SSE)
+			flusher.Flush()
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("⚠️  Ошибка чтения SSE потока: %v", err)
+			}
+			break
+		}
+	}
+
+	return written
 }
 
 func handleOverride(w http.ResponseWriter, r *http.Request, override *ResponseOverride) {
@@ -914,8 +1043,12 @@ func shouldSkipHeader(name string) bool {
 		"Proxy-Authorization",
 		"Te",
 		"Trailer",
-		"Transfer-Encoding", // Добавлено для исключения Transfer-Encoding
 		"Upgrade",
+	}
+
+	// В стриминговом режиме НЕ пропускаем Transfer-Encoding
+	if !logSettings.EnableStreaming {
+		skipHeaders = append(skipHeaders, "Transfer-Encoding")
 	}
 
 	lowerName := strings.ToLower(name)
