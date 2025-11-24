@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -67,10 +69,31 @@ type ProxySettings struct {
 	Timeout       time.Duration
 }
 
+// CacheEntry запись в кеше
+type CacheEntry struct {
+	StatusCode  int
+	Headers     http.Header
+	Body        []byte
+	CachedAt    time.Time
+	ExpiresAt   time.Time
+	RequestURL  string
+	RequestHash string
+}
+
+// CacheSettings настройки кеширования
+type CacheSettings struct {
+	Enabled bool
+	TTL     time.Duration
+}
+
 var config Config
 var logSettings LogSettings
 var proxySettings ProxySettings
+var cacheSettings CacheSettings
 var httpClient *http.Client
+var responseCache sync.Map // map[string]*CacheEntry
+var cacheHits int64
+var cacheMisses int64
 
 func main() {
 	// Получаем целевой хост из переменной окружения
@@ -87,6 +110,9 @@ func main() {
 
 	// Настраиваем логирование
 	setupLogSettings()
+
+	// Настраиваем кеширование
+	setupCacheSettings()
 
 	// Настраиваем прокси
 	setupProxySettings()
@@ -123,6 +149,7 @@ func main() {
 	log.Printf("Активных правил подмены: %d", countActiveOverrides())
 	log.Printf("Статистика доступна на: http://127.0.0.1:%s/_proxy_stats", port)
 	printLogSettings()
+	printCacheSettings()
 	printProxySettings()
 
 	if targetURL.Path != "" && targetURL.Path != "/" {
@@ -161,6 +188,39 @@ func setupLogSettings() {
 
 	// Настройка стримингового режима
 	logSettings.EnableStreaming = os.Getenv("ENABLE_STREAMING") == "true"
+}
+
+func setupCacheSettings() {
+	cacheTTLStr := os.Getenv("CACHE_TTL")
+	if cacheTTLStr == "" {
+		cacheSettings.Enabled = false
+		return
+	}
+
+	ttl, err := time.ParseDuration(cacheTTLStr)
+	if err != nil {
+		log.Printf("⚠️  Неверный формат CACHE_TTL: %s, кеширование отключено", cacheTTLStr)
+		cacheSettings.Enabled = false
+		return
+	}
+
+	cacheSettings.Enabled = true
+	cacheSettings.TTL = ttl
+}
+
+func printCacheSettings() {
+	log.Printf("💾 Настройки кеширования:")
+	if cacheSettings.Enabled {
+		log.Printf("   Enabled: ✅")
+		log.Printf("   TTL: %v", cacheSettings.TTL)
+	} else {
+		log.Printf("   Enabled: ❌")
+	}
+	log.Printf("")
+	log.Printf("🔧 Переменная окружения для кеширования:")
+	log.Printf("   - CACHE_TTL=3h - кешировать запросы на 3 часа")
+	log.Printf("   - CACHE_TTL=30m - кешировать запросы на 30 минут")
+	log.Printf("")
 }
 
 func setupProxySettings() {
@@ -497,6 +557,13 @@ func showStats(w http.ResponseWriter, r *http.Request) {
 			"skip_tls_verify": proxySettings.SkipTLSVerify,
 			"timeout":         proxySettings.Timeout.String(),
 		},
+		"cache_settings": map[string]interface{}{
+			"enabled":      cacheSettings.Enabled,
+			"ttl":          cacheSettings.TTL.String(),
+			"cache_hits":   atomic.LoadInt64(&cacheHits),
+			"cache_misses": atomic.LoadInt64(&cacheMisses),
+			"cache_size":   getCacheSize(),
+		},
 	}
 
 	json.NewEncoder(w).Encode(response)
@@ -543,7 +610,12 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 	}
 
 	// Выбираем режим проксирования
-	if logSettings.EnableStreaming {
+	// Приоритет: кеширование > стриминг (кеш требует буферизации)
+	if cacheSettings.Enabled && logSettings.EnableStreaming {
+		log.Printf("⚠️  Кеширование имеет приоритет над стримингом (используется буферизованный режим)")
+	}
+
+	if logSettings.EnableStreaming && !cacheSettings.Enabled {
 		log.Printf("🚀 Стриминговый режим включен")
 		streamingProxyRequest(w, r, proxyURL, targetURL)
 	} else {
@@ -553,6 +625,18 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 
 // bufferedProxyRequest - исходный режим с буферизацией для логирования
 func bufferedProxyRequest(w http.ResponseWriter, r *http.Request, proxyURL *url.URL, targetURL *url.URL) {
+	// Проверяем кеш если включен
+	if cacheSettings.Enabled {
+		cacheKey := generateCacheKey(r.Method, proxyURL.String(), r.Header)
+		if cached := getCachedResponse(cacheKey); cached != nil {
+			atomic.AddInt64(&cacheHits, 1)
+			log.Printf("💾 Ответ из кеша (срок действия до %s)", cached.ExpiresAt.Format("15:04:05"))
+			serveCachedResponse(w, cached)
+			return
+		}
+		atomic.AddInt64(&cacheMisses, 1)
+	}
+
 	// Читаем тело запроса ПОЛНОСТЬЮ
 	var requestBody []byte
 	var bodyReader io.Reader
@@ -634,6 +718,12 @@ func bufferedProxyRequest(w http.ResponseWriter, r *http.Request, proxyURL *url.
 	// Логируем тело ответа
 	if len(responseBody) > 0 && logSettings.ShowResponseBody {
 		logBody("📥 Response Body", responseBody, resp.Header.Get("Content-Type"), resp.Header)
+	}
+
+	// Сохраняем в кеш если включен
+	if cacheSettings.Enabled {
+		cacheKey := generateCacheKey(r.Method, proxyURL.String(), r.Header)
+		cacheResponse(cacheKey, resp.StatusCode, resp.Header, responseBody, proxyURL.String())
 	}
 
 	// Копируем заголовки ответа
@@ -1058,4 +1148,129 @@ func shouldSkipHeader(name string) bool {
 		}
 	}
 	return false
+}
+
+// generateCacheKey генерирует ключ кеша на основе метода, URL и заголовков
+func generateCacheKey(method, url string, headers http.Header) string {
+	h := sha256.New()
+	h.Write([]byte(method))
+	h.Write([]byte(url))
+
+	// Добавляем важные заголовки в ключ кеша
+	if auth := headers.Get("Authorization"); auth != "" {
+		h.Write([]byte(auth))
+	}
+	if contentType := headers.Get("Content-Type"); contentType != "" {
+		h.Write([]byte(contentType))
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// getCachedResponse получает ответ из кеша
+func getCachedResponse(key string) *CacheEntry {
+	if val, ok := responseCache.Load(key); ok {
+		entry := val.(*CacheEntry)
+		if time.Now().Before(entry.ExpiresAt) {
+			return entry
+		}
+		// Удаляем устаревшую запись
+		responseCache.Delete(key)
+	}
+	return nil
+}
+
+// cacheResponse сохраняет ответ в кеш
+func cacheResponse(key string, statusCode int, headers http.Header, body []byte, url string) {
+	now := time.Now()
+	entry := &CacheEntry{
+		StatusCode:  statusCode,
+		Headers:     cloneHeaders(headers),
+		Body:        body,
+		CachedAt:    now,
+		ExpiresAt:   now.Add(cacheSettings.TTL),
+		RequestURL:  url,
+		RequestHash: key,
+	}
+	responseCache.Store(key, entry)
+	log.Printf("💾 Ответ сохранен в кеш (срок действия до %s)", entry.ExpiresAt.Format("15:04:05"))
+}
+
+// serveCachedResponse отправляет кешированный ответ клиенту
+func serveCachedResponse(w http.ResponseWriter, entry *CacheEntry) {
+	log.Printf("📥 Response Status: %d (cached)", entry.StatusCode)
+
+	// Логируем заголовки с отметкой кеша
+	if logSettings.ShowResponseHeaders {
+		logHeaders("📥 Response Headers (cached)", entry.Headers)
+	}
+
+	// Логируем тело с обрезанием
+	if len(entry.Body) > 0 && logSettings.ShowResponseBody {
+		// Принудительно обрезаем кешированные логи
+		contentType := entry.Headers.Get("Content-Type")
+		logCachedBody("📥 Response Body (cached)", entry.Body, contentType, entry.Headers)
+	}
+
+	// Копируем заголовки
+	copyHeaders(w.Header(), entry.Headers)
+
+	// Добавляем заголовок о кешировании
+	w.Header().Set("X-Cache", "HIT")
+	w.Header().Set("X-Cache-Expires", entry.ExpiresAt.Format(time.RFC3339))
+
+	// Устанавливаем статус код
+	w.WriteHeader(entry.StatusCode)
+
+	// Отправляем тело
+	w.Write(entry.Body)
+
+	log.Printf("✅ Запрос завершен (из кеша)\n")
+}
+
+// logCachedBody логирует кешированное тело с обрезанием
+func logCachedBody(prefix string, body []byte, contentType string, headers http.Header) {
+	if len(body) == 0 {
+		log.Printf("%s: [Empty]", prefix)
+		return
+	}
+
+	decompressedBody := decompressIfNeeded(body, headers)
+
+	// Всегда обрезаем для кешированных ответов
+	maxLen := logSettings.MaxLogLength
+	if maxLen == 0 {
+		maxLen = 2000
+	}
+
+	if utf8.Valid(decompressedBody) {
+		text := string(decompressedBody)
+		if len(text) > maxLen {
+			log.Printf("%s: %s... [truncated, total: %d bytes]", prefix, text[:maxLen], len(text))
+		} else {
+			log.Printf("%s: %s", prefix, text)
+		}
+	} else {
+		log.Printf("%s: [Non-UTF8 data, %d bytes]", prefix, len(decompressedBody))
+		logHexDump(prefix, body)
+	}
+}
+
+// cloneHeaders создает копию заголовков
+func cloneHeaders(headers http.Header) http.Header {
+	clone := make(http.Header)
+	for key, values := range headers {
+		clone[key] = append([]string(nil), values...)
+	}
+	return clone
+}
+
+// getCacheSize возвращает количество записей в кеше
+func getCacheSize() int {
+	size := 0
+	responseCache.Range(func(key, value interface{}) bool {
+		size++
+		return true
+	})
+	return size
 }
