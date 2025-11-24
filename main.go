@@ -23,24 +23,33 @@ import (
 	"unicode/utf8"
 )
 
+// BodyReplacement описывает правило замены в теле ответа
+type BodyReplacement struct {
+	Find          string         `json:"find"`     // Что искать
+	Replace       string         `json:"replace"`  // На что заменить
+	IsRegex       bool           `json:"is_regex"` // Использовать regex для поиска
+	compiledRegex *regexp.Regexp // Скомпилированный regex (не сериализуется)
+}
+
 // ResponseOverride конфигурация для подмены ответа
 type ResponseOverride struct {
-	Name          string            `json:"name"`          // Имя правила для логов
-	Method        string            `json:"method"`        // HTTP метод (* для любого)
-	URLPattern    string            `json:"url_pattern"`   // Паттерн URL (поддерживает regex)
-	IsRegex       bool              `json:"is_regex"`      // Использовать regex для паттерна
-	StatusCode    int               `json:"status_code"`   // HTTP статус код
-	Headers       map[string]string `json:"headers"`       // Заголовки ответа
-	BodyFile      string            `json:"body_file"`     // Путь к файлу с телом ответа
-	BodyText      string            `json:"body_text"`     // Текст ответа (альтернатива файлу)
-	Enabled       bool              `json:"enabled"`       // Включено ли правило
-	TriggerAfter  int               `json:"trigger_after"` // После скольких запросов срабатывать (0 = сразу)
-	MaxTriggers   int               `json:"max_triggers"`  // Максимальное количество срабатываний (-1 = бесконечно)
-	ResetAfter    int               `json:"reset_after"`   // Сброс счетчика через N запросов (0 = не сбрасывать)
-	compiledRegex *regexp.Regexp    // Скомпилированный regex (не сериализуется)
-	requestCount  int               // Счетчик запросов (не сериализуется)
-	triggerCount  int               // Счетчик срабатываний (не сериализуется)
-	mutex         sync.Mutex        // Мьютекс для безопасности (не сериализуется)
+	Name             string            `json:"name"`              // Имя правила для логов
+	Method           string            `json:"method"`            // HTTP метод (* для любого)
+	URLPattern       string            `json:"url_pattern"`       // Паттерн URL (поддерживает regex)
+	IsRegex          bool              `json:"is_regex"`          // Использовать regex для паттерна
+	StatusCode       int               `json:"status_code"`       // HTTP статус код
+	Headers          map[string]string `json:"headers"`           // Заголовки ответа
+	BodyFile         string            `json:"body_file"`         // Путь к файлу с телом ответа
+	BodyText         string            `json:"body_text"`         // Текст ответа (альтернатива файлу)
+	BodyReplacements []BodyReplacement `json:"body_replacements"` // Замены в теле ответа
+	Enabled          bool              `json:"enabled"`           // Включено ли правило
+	TriggerAfter     int               `json:"trigger_after"`     // После скольких запросов срабатывать (0 = сразу)
+	MaxTriggers      int               `json:"max_triggers"`      // Максимальное количество срабатываний (-1 = бесконечно)
+	ResetAfter       int               `json:"reset_after"`       // Сброс счетчика через N запросов (0 = не сбрасывать)
+	compiledRegex    *regexp.Regexp    // Скомпилированный regex (не сериализуется)
+	requestCount     int               // Счетчик запросов (не сериализуется)
+	triggerCount     int               // Счетчик срабатываний (не сериализуется)
+	mutex            sync.Mutex        // Мьютекс для безопасности (не сериализуется)
 }
 
 // Config конфигурация всех подмен
@@ -374,6 +383,20 @@ func loadConfig(configFile string) {
 				override.compiledRegex = compiled
 			}
 		}
+
+		// Компилируем regex для замен в body
+		for j := range override.BodyReplacements {
+			replacement := &override.BodyReplacements[j]
+			if replacement.IsRegex {
+				compiled, err := regexp.Compile(replacement.Find)
+				if err != nil {
+					log.Printf("⚠️  Ошибка компиляции regex замены '%s': %v", replacement.Find, err)
+				} else {
+					replacement.compiledRegex = compiled
+				}
+			}
+		}
+
 		// Инициализируем счетчики
 		override.requestCount = 0
 		override.triggerCount = 0
@@ -530,6 +553,39 @@ func findMatchingOverride(method, urlPath string) *ResponseOverride {
 	return nil
 }
 
+// findMatchingOverrideForReplacements ищет правило только для применения замен (без учета триггеров)
+func findMatchingOverrideForReplacements(method, urlPath string) *ResponseOverride {
+	for i := range config.Overrides {
+		override := &config.Overrides[i]
+		if !override.Enabled {
+			continue
+		}
+
+		// Пропускаем если нет замен
+		if len(override.BodyReplacements) == 0 {
+			continue
+		}
+
+		// Проверяем метод
+		if override.Method != "*" && !strings.EqualFold(override.Method, method) {
+			continue
+		}
+
+		// Проверяем URL
+		var matches bool
+		if override.IsRegex {
+			matches = override.compiledRegex != nil && override.compiledRegex.MatchString(urlPath)
+		} else {
+			matches = strings.Contains(urlPath, override.URLPattern)
+		}
+
+		if matches {
+			return override
+		}
+	}
+	return nil
+}
+
 func showStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -623,9 +679,17 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 		fullURL += "?" + r.URL.RawQuery
 	}
 	if override := findMatchingOverride(r.Method, fullURL); override != nil {
-		log.Printf("🎭 Применяем подмену: %s", override.Name)
-		handleOverride(w, r, override)
-		return
+		// Если есть body_file или body_text - это полная подмена, не идём на сервер
+		if override.BodyFile != "" || override.BodyText != "" {
+			log.Printf("🎭 Применяем полную подмену: %s", override.Name)
+			handleOverride(w, r, override)
+			return
+		}
+		// Если есть только body_replacements - продолжаем с проксированием
+		// (замены будут применены в bufferedProxyRequest)
+		if len(override.BodyReplacements) > 0 {
+			log.Printf("🔄 Правило '%s' будет применять замены к проксированному ответу", override.Name)
+		}
 	}
 
 	// Выбираем режим проксирования
@@ -739,6 +803,53 @@ func bufferedProxyRequest(w http.ResponseWriter, r *http.Request, proxyURL *url.
 		logBody("📥 Response Body", responseBody, resp.Header.Get("Content-Type"), resp.Header)
 	}
 
+	// Применяем замены из правил override если они есть (для всех запросов)
+	fullURL := r.URL.Path
+	if r.URL.RawQuery != "" {
+		fullURL += "?" + r.URL.RawQuery
+	}
+	if matchedOverride := findMatchingOverrideForReplacements(r.Method, fullURL); matchedOverride != nil {
+		if len(matchedOverride.BodyReplacements) > 0 && len(responseBody) > 0 {
+			log.Printf("🔄 Применяем замены из правила '%s' к проксированному ответу...", matchedOverride.Name)
+
+			// Проверяем и распаковываем если данные сжаты
+			wasCompressed := false
+			contentEncoding := resp.Header.Get("Content-Encoding")
+			var decompressedBody []byte
+
+			if strings.ToLower(contentEncoding) == "gzip" {
+				if decompressed, err := decompressGzip(responseBody); err == nil {
+					log.Printf("🔓 Распакован gzip для замен: %d -> %d bytes", len(responseBody), len(decompressed))
+					decompressedBody = decompressed
+					wasCompressed = true
+				} else {
+					log.Printf("⚠️  Ошибка распаковки gzip: %v", err)
+					decompressedBody = responseBody
+				}
+			} else {
+				decompressedBody = responseBody
+			}
+
+			// Применяем замены к распакованным данным
+			modifiedBody := applyBodyReplacements(decompressedBody, matchedOverride.BodyReplacements)
+
+			// Если было сжатие - сжимаем обратно
+			if wasCompressed {
+				if compressed, err := compressGzip(modifiedBody); err == nil {
+					log.Printf("🔒 Сжат обратно в gzip: %d -> %d bytes", len(modifiedBody), len(compressed))
+					responseBody = compressed
+				} else {
+					log.Printf("⚠️  Ошибка сжатия gzip: %v, отправляем без сжатия", err)
+					responseBody = modifiedBody
+					// Убираем заголовок Content-Encoding если не можем сжать обратно
+					resp.Header.Del("Content-Encoding")
+				}
+			} else {
+				responseBody = modifiedBody
+			}
+		}
+	}
+
 	// Сохраняем в кеш если включен
 	if cacheSettings.Enabled {
 		cacheKey := generateCacheKey(r.Method, proxyURL.String(), r.Header)
@@ -747,6 +858,11 @@ func bufferedProxyRequest(w http.ResponseWriter, r *http.Request, proxyURL *url.
 
 	// Копируем заголовки ответа
 	copyHeaders(w.Header(), resp.Header)
+
+	// Обновляем Content-Length если размер изменился после замен
+	if len(responseBody) > 0 {
+		w.Header().Set("Content-Length", strconv.Itoa(len(responseBody)))
+	}
 
 	// Устанавливаем статус код
 	w.WriteHeader(resp.StatusCode)
@@ -870,6 +986,56 @@ func streamWithFlush(w io.Writer, src io.Reader, flusher http.Flusher) int64 {
 	return written
 }
 
+// applyBodyReplacements применяет замены к телу ответа
+func applyBodyReplacements(body []byte, replacements []BodyReplacement) []byte {
+	if len(replacements) == 0 {
+		return body
+	}
+
+	result := body
+	replacementsApplied := 0
+
+	for i, replacement := range replacements {
+		if replacement.IsRegex && replacement.compiledRegex != nil {
+			// Regex замена
+			beforeLen := len(result)
+			countBefore := bytes.Count(result, []byte(replacement.Find))
+			result = replacement.compiledRegex.ReplaceAll(result, []byte(replacement.Replace))
+			afterLen := len(result)
+
+			log.Printf("🔄 Замена #%d (regex): '%s' -> '%s'", i+1, replacement.Find, replacement.Replace)
+			log.Printf("   Найдено совпадений: %d, размер: %d -> %d bytes", countBefore, beforeLen, afterLen)
+
+			if beforeLen != afterLen {
+				replacementsApplied++
+			}
+		} else {
+			// Простая текстовая замена (глобальная)
+			searchBytes := []byte(replacement.Find)
+			replaceBytes := []byte(replacement.Replace)
+			beforeLen := len(result)
+			countBefore := bytes.Count(result, searchBytes)
+			result = bytes.ReplaceAll(result, searchBytes, replaceBytes)
+			afterLen := len(result)
+
+			log.Printf("🔄 Замена #%d (текст): '%s' -> '%s'", i+1, replacement.Find, replacement.Replace)
+			log.Printf("   Найдено совпадений: %d, размер: %d -> %d bytes", countBefore, beforeLen, afterLen)
+
+			if countBefore > 0 {
+				replacementsApplied++
+			}
+		}
+	}
+
+	if replacementsApplied > 0 {
+		log.Printf("✨ Всего применено замен: %d из %d", replacementsApplied, len(replacements))
+	} else {
+		log.Printf("⚠️  Ни одна замена не была применена (совпадений не найдено)")
+	}
+
+	return result
+}
+
 func handleOverride(w http.ResponseWriter, r *http.Request, override *ResponseOverride) {
 	// Устанавливаем заголовки
 	for key, value := range override.Headers {
@@ -893,6 +1059,12 @@ func handleOverride(w http.ResponseWriter, r *http.Request, override *ResponseOv
 		// Используем текст
 		responseBody = []byte(override.BodyText)
 		log.Printf("📝 Использован текст ответа (%d bytes)", len(responseBody))
+	}
+
+	// Применяем замены в body если они есть
+	if len(override.BodyReplacements) > 0 && len(responseBody) > 0 {
+		log.Printf("🔄 Применяем замены в body...")
+		responseBody = applyBodyReplacements(responseBody, override.BodyReplacements)
 	}
 
 	// Устанавливаем Content-Length если есть тело
@@ -1117,6 +1289,24 @@ func decompressGzip(data []byte) ([]byte, error) {
 	defer reader.Close()
 
 	return io.ReadAll(reader)
+}
+
+func compressGzip(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+
+	_, err := writer.Write(data)
+	if err != nil {
+		writer.Close()
+		return nil, err
+	}
+
+	err = writer.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
 }
 
 func min(a, b int) int {
