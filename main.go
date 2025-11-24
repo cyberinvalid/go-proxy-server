@@ -108,9 +108,7 @@ var cacheMisses int64
 func main() {
 	// Получаем целевой хост из переменной окружения
 	targetHost := os.Getenv("PROXY_TARGET")
-	if targetHost == "" {
-		targetHost = "https://test.yandex.net" // значение по умолчанию
-	}
+	isProxyMode := targetHost == ""
 
 	// Получаем порт для локального сервера
 	port := os.Getenv("PROXY_PORT")
@@ -137,16 +135,23 @@ func main() {
 	}
 	loadConfig(configFile)
 
-	// Парсим URL целевого хоста
-	targetURL, err := url.Parse(targetHost)
-	if err != nil {
-		log.Fatalf("Ошибка парсинга целевого URL: %v", err)
-	}
-
 	// Создаем обработчик для всех запросов
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		proxyRequest(w, r, targetURL)
-	})
+	if isProxyMode {
+		// Режим HTTP прокси - берём URL из запроса
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			handleProxyMode(w, r)
+		})
+	} else {
+		// Режим forward proxy - фиксированный целевой хост
+		targetURL, err := url.Parse(targetHost)
+		if err != nil {
+			log.Fatalf("Ошибка парсинга целевого URL: %v", err)
+		}
+
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			proxyRequest(w, r, targetURL)
+		})
+	}
 
 	// Добавляем обработчик для просмотра статистики
 	http.HandleFunc("/_proxy_stats", func(w http.ResponseWriter, r *http.Request) {
@@ -154,7 +159,17 @@ func main() {
 	})
 
 	log.Printf("Прокси сервер запущен на http://127.0.0.1:%s", port)
-	log.Printf("Проксирование запросов на: %s", targetHost)
+	if isProxyMode {
+		log.Printf("🌐 Режим: HTTP Proxy (целевой URL берётся из запроса)")
+		log.Printf("💡 Настройте прокси в браузере: http://127.0.0.1:%s", port)
+	} else {
+		log.Printf("🎯 Режим: Forward Proxy")
+		log.Printf("Проксирование запросов на: %s", targetHost)
+		targetURL, _ := url.Parse(targetHost)
+		if targetURL.Path != "" && targetURL.Path != "/" {
+			log.Printf("Базовый path: %s", targetURL.Path)
+		}
+	}
 	log.Printf("Конфигурация подмен: %s", configFile)
 	log.Printf("Активных правил подмены: %d", countActiveOverrides())
 	log.Printf("Статистика доступна на: http://127.0.0.1:%s/_proxy_stats", port)
@@ -162,13 +177,8 @@ func main() {
 	printCacheSettings()
 	printProxySettings()
 
-	if targetURL.Path != "" && targetURL.Path != "/" {
-		log.Printf("Базовый path: %s", targetURL.Path)
-	}
-
 	// Запускаем сервер
-	err = http.ListenAndServe("0.0.0.0:"+port, nil)
-	if err != nil {
+	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
 		log.Fatalf("Ошибка запуска сервера: %v", err)
 	}
 }
@@ -637,6 +647,37 @@ func showStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(response)
+}
+
+// handleProxyMode обрабатывает запросы в режиме HTTP прокси
+func handleProxyMode(w http.ResponseWriter, r *http.Request) {
+	// Пропускаем внутренние эндпоинты
+	if strings.HasPrefix(r.URL.Path, "/_proxy") {
+		if r.URL.Path == "/_proxy_stats" {
+			showStats(w, r)
+		}
+		return
+	}
+
+	// В режиме HTTP прокси URL должен быть полным
+	if r.URL.Scheme == "" || r.URL.Host == "" {
+		http.Error(w, "Bad Request: требуется полный URL (http://example.com/path)", http.StatusBadRequest)
+		log.Printf("❌ Неверный запрос: отсутствует scheme или host в URL: %s", r.URL.String())
+		return
+	}
+
+	// Парсим целевой URL из запроса
+	targetURL, err := url.Parse(r.URL.Scheme + "://" + r.URL.Host)
+	if err != nil {
+		http.Error(w, "Bad Request: неверный URL", http.StatusBadRequest)
+		log.Printf("❌ Ошибка парсинга URL: %v", err)
+		return
+	}
+
+	log.Printf("🌐 Proxy Mode: %s %s", r.Method, r.URL.String())
+
+	// Используем стандартную функцию проксирования
+	proxyRequest(w, r, targetURL)
 }
 
 func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
