@@ -135,10 +135,17 @@ func main() {
 	}
 	loadConfig(configFile)
 
-	// Создаем обработчик для всех запросов
+	// Создаем handler для обработки запросов
+	var handler http.Handler
+
 	if isProxyMode {
 		// Режим HTTP прокси - берём URL из запроса
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Обрабатываем статистику
+			if r.URL.Path == "/_proxy_stats" {
+				showStats(w, r)
+				return
+			}
 			handleProxyMode(w, r)
 		})
 	} else {
@@ -148,20 +155,21 @@ func main() {
 			log.Fatalf("Ошибка парсинга целевого URL: %v", err)
 		}
 
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Обрабатываем статистику
+			if r.URL.Path == "/_proxy_stats" {
+				showStats(w, r)
+				return
+			}
 			proxyRequest(w, r, targetURL)
 		})
 	}
 
-	// Добавляем обработчик для просмотра статистики
-	http.HandleFunc("/_proxy_stats", func(w http.ResponseWriter, r *http.Request) {
-		showStats(w, r)
-	})
-
 	log.Printf("Прокси сервер запущен на http://127.0.0.1:%s", port)
 	if isProxyMode {
 		log.Printf("🌐 Режим: HTTP Proxy (целевой URL берётся из запроса)")
-		log.Printf("💡 Настройте прокси в браузере: http://127.0.0.1:%s", port)
+		log.Printf("💡 Для клиента используйте Custom Dialer без Proxy")
+		log.Printf("💡 Пример: DialContext подключается к 127.0.0.1:%s", port)
 	} else {
 		log.Printf("🎯 Режим: Forward Proxy")
 		log.Printf("Проксирование запросов на: %s", targetHost)
@@ -178,7 +186,7 @@ func main() {
 	printProxySettings()
 
 	// Запускаем сервер
-	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
+	if err := http.ListenAndServe("0.0.0.0:"+port, handler); err != nil {
 		log.Fatalf("Ошибка запуска сервера: %v", err)
 	}
 }
@@ -653,17 +661,48 @@ func showStats(w http.ResponseWriter, r *http.Request) {
 func handleProxyMode(w http.ResponseWriter, r *http.Request) {
 	// Пропускаем внутренние эндпоинты
 	if strings.HasPrefix(r.URL.Path, "/_proxy") {
-		if r.URL.Path == "/_proxy_stats" {
-			showStats(w, r)
-		}
 		return
 	}
 
+	// Обрабатываем CONNECT - отклоняем с объяснением
+	if r.Method == "CONNECT" {
+		http.Error(w, "CONNECT method not supported. Please use Custom Dialer without Proxy setting in Transport.", http.StatusMethodNotAllowed)
+		log.Printf("❌ CONNECT запрос отклонён: %s", r.Host)
+		log.Printf("💡 Используйте Custom Dialer с DialContext и DialTLSContext")
+		log.Printf("💡 Не устанавливайте transport.Proxy в клиенте")
+		return
+	}
+
+	// Детальное логирование входящего запроса
+	log.Printf("📨 Входящий запрос: %s %s", r.Method, r.URL.String())
+	log.Printf("   Host: %s", r.Host)
+	log.Printf("   URL.Scheme: %s", r.URL.Scheme)
+	log.Printf("   URL.Host: %s", r.URL.Host)
+	log.Printf("   URL.Path: %s", r.URL.Path)
+	log.Printf("   URL.RawQuery: %s", r.URL.RawQuery)
+
 	// В режиме HTTP прокси URL должен быть полным
 	if r.URL.Scheme == "" || r.URL.Host == "" {
-		http.Error(w, "Bad Request: требуется полный URL (http://example.com/path)", http.StatusBadRequest)
-		log.Printf("❌ Неверный запрос: отсутствует scheme или host в URL: %s", r.URL.String())
-		return
+		// Возможно URL в заголовке Host
+		if r.Host != "" && r.URL.Scheme == "" {
+			// Пытаемся восстановить scheme из RequestURI
+			if strings.HasPrefix(r.RequestURI, "https://") {
+				r.URL.Scheme = "https"
+			} else if strings.HasPrefix(r.RequestURI, "http://") {
+				r.URL.Scheme = "http"
+			} else {
+				r.URL.Scheme = "http" // по умолчанию
+			}
+			r.URL.Host = r.Host
+			log.Printf("🔧 Восстановлен URL: %s://%s%s", r.URL.Scheme, r.URL.Host, r.URL.Path)
+		} else {
+			http.Error(w, "Bad Request: требуется полный URL (http://example.com/path)", http.StatusBadRequest)
+			log.Printf("❌ Неверный запрос: отсутствует scheme или host")
+			log.Printf("   RequestURI: %s", r.RequestURI)
+			log.Printf("   URL: %s", r.URL.String())
+			log.Printf("   Host header: %s", r.Host)
+			return
+		}
 	}
 
 	// Парсим целевой URL из запроса
