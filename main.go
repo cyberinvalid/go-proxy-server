@@ -505,8 +505,8 @@ func createExampleConfig(configFile string) {
 
 func countActiveOverrides() int {
 	count := 0
-	for _, override := range config.Overrides {
-		if override.Enabled {
+	for i := range config.Overrides {
+		if config.Overrides[i].Enabled {
 			count++
 		}
 	}
@@ -609,7 +609,8 @@ func showStats(w http.ResponseWriter, r *http.Request) {
 
 	stats := make([]map[string]interface{}, 0, len(config.Overrides))
 
-	for _, override := range config.Overrides {
+	for i := range config.Overrides {
+		override := &config.Overrides[i]
 		override.mutex.Lock()
 		stat := map[string]interface{}{
 			"name":          override.Name,
