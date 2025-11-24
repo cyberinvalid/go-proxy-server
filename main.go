@@ -82,8 +82,9 @@ type CacheEntry struct {
 
 // CacheSettings настройки кеширования
 type CacheSettings struct {
-	Enabled bool
-	TTL     time.Duration
+	Enabled    bool
+	TTL        time.Duration
+	KeyHeaders []string // Дополнительные заголовки для ключа кеша
 }
 
 var config Config
@@ -206,6 +207,15 @@ func setupCacheSettings() {
 
 	cacheSettings.Enabled = true
 	cacheSettings.TTL = ttl
+
+	// Читаем дополнительные заголовки для ключа кеша
+	keyHeaders := os.Getenv("CACHE_KEY_HEADERS")
+	if keyHeaders != "" {
+		cacheSettings.KeyHeaders = strings.Split(keyHeaders, ",")
+		for i := range cacheSettings.KeyHeaders {
+			cacheSettings.KeyHeaders[i] = strings.TrimSpace(cacheSettings.KeyHeaders[i])
+		}
+	}
 }
 
 func printCacheSettings() {
@@ -213,13 +223,17 @@ func printCacheSettings() {
 	if cacheSettings.Enabled {
 		log.Printf("   Enabled: ✅")
 		log.Printf("   TTL: %v", cacheSettings.TTL)
+		if len(cacheSettings.KeyHeaders) > 0 {
+			log.Printf("   Key Headers: %v", cacheSettings.KeyHeaders)
+		}
 	} else {
 		log.Printf("   Enabled: ❌")
 	}
 	log.Printf("")
-	log.Printf("🔧 Переменная окружения для кеширования:")
+	log.Printf("🔧 Переменные окружения для кеширования:")
 	log.Printf("   - CACHE_TTL=3h - кешировать запросы на 3 часа")
 	log.Printf("   - CACHE_TTL=30m - кешировать запросы на 30 минут")
+	log.Printf("   - CACHE_KEY_HEADERS=X-Ya-Dest-Url,X-Custom - учитывать заголовки в ключе кеша")
 	log.Printf("")
 }
 
@@ -1163,10 +1177,20 @@ func generateCacheKey(method, url string, headers http.Header) string {
 
 	// Добавляем важные заголовки в ключ кеша
 	if auth := headers.Get("Authorization"); auth != "" {
+		h.Write([]byte("Authorization:"))
 		h.Write([]byte(auth))
 	}
 	if contentType := headers.Get("Content-Type"); contentType != "" {
+		h.Write([]byte("Content-Type:"))
 		h.Write([]byte(contentType))
+	}
+
+	// Добавляем дополнительные заголовки из настроек
+	for _, headerName := range cacheSettings.KeyHeaders {
+		if headerValue := headers.Get(headerName); headerValue != "" {
+			h.Write([]byte(headerName + ":"))
+			h.Write([]byte(headerValue))
+		}
 	}
 
 	return hex.EncodeToString(h.Sum(nil))
