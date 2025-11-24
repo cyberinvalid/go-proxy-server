@@ -603,7 +603,12 @@ func proxyRequest(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
 	}
 
 	// Проверяем, есть ли подмена для этого запроса
-	if override := findMatchingOverride(r.Method, r.URL.Path); override != nil {
+	// Передаем полный URL с query параметрами
+	fullURL := r.URL.Path
+	if r.URL.RawQuery != "" {
+		fullURL += "?" + r.URL.RawQuery
+	}
+	if override := findMatchingOverride(r.Method, fullURL); override != nil {
 		log.Printf("🎭 Применяем подмену: %s", override.Name)
 		handleOverride(w, r, override)
 		return
