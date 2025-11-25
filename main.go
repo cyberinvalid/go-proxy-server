@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -104,6 +105,8 @@ var httpClient *http.Client
 var responseCache sync.Map // map[string]*CacheEntry
 var cacheHits int64
 var cacheMisses int64
+var cacheModified int32     // Флаг изменения кеша (атомарный)
+var cachePersistFile string // Путь к файлу кеша
 
 func main() {
 	// Получаем целевой хост из переменной окружения
@@ -121,6 +124,19 @@ func main() {
 
 	// Настраиваем кеширование
 	setupCacheSettings()
+
+	// Путь к файлу кеша
+	cachePersistFile = os.Getenv("CACHE_FILE")
+	if cachePersistFile == "" {
+		cachePersistFile = "cache.gob"
+	}
+
+	// Восстанавливаем кеш из файла если включено кеширование
+	if cacheSettings.Enabled {
+		loadCacheFromDisk()
+		// Запускаем горутину для периодического сохранения
+		go cachePersistenceWorker()
+	}
 
 	// Настраиваем прокси
 	setupProxySettings()
@@ -261,6 +277,7 @@ func printCacheSettings() {
 	log.Printf("   - CACHE_TTL=3h - кешировать запросы на 3 часа")
 	log.Printf("   - CACHE_TTL=30m - кешировать запросы на 30 минут")
 	log.Printf("   - CACHE_KEY_HEADERS=X-Ya-Dest-Url,X-Custom - учитывать заголовки в ключе кеша")
+	log.Printf("   - CACHE_FILE=cache.gob - путь к файлу для сохранения кеша (gob+gzip)")
 	log.Printf("")
 }
 
@@ -1493,6 +1510,7 @@ func cacheResponse(key string, statusCode int, headers http.Header, body []byte,
 		RequestHash: key,
 	}
 	responseCache.Store(key, entry)
+	atomic.StoreInt32(&cacheModified, 1) // Отмечаем, что кеш изменился
 	log.Printf("💾 Ответ сохранен в кеш (срок действия до %s)", entry.ExpiresAt.Format("15:04:05"))
 }
 
@@ -1573,4 +1591,144 @@ func getCacheSize() int {
 		return true
 	})
 	return size
+}
+
+// cachePersistenceWorker периодически сохраняет кеш на диск при изменениях
+func cachePersistenceWorker() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Проверяем, был ли изменен кеш
+		if atomic.LoadInt32(&cacheModified) == 1 {
+			if err := saveCacheToDisk(); err != nil {
+				log.Printf("⚠️  Ошибка сохранения кеша: %v", err)
+			}
+			atomic.StoreInt32(&cacheModified, 0) // Сбрасываем флаг
+		}
+	}
+}
+
+// CacheSnapshot структура для сериализации кеша
+type CacheSnapshot struct {
+	Entries   map[string]*CacheEntry
+	SavedAt   time.Time
+	CacheHits int64
+	CacheMiss int64
+}
+
+// saveCacheToDisk сохраняет кеш на диск в формате gob + gzip
+func saveCacheToDisk() error {
+	snapshot := CacheSnapshot{
+		Entries:   make(map[string]*CacheEntry),
+		SavedAt:   time.Now(),
+		CacheHits: atomic.LoadInt64(&cacheHits),
+		CacheMiss: atomic.LoadInt64(&cacheMisses),
+	}
+
+	// Собираем все записи из sync.Map
+	count := 0
+	responseCache.Range(func(key, value interface{}) bool {
+		keyStr := key.(string)
+		entry := value.(*CacheEntry)
+
+		// Сохраняем только актуальные записи
+		if time.Now().Before(entry.ExpiresAt) {
+			snapshot.Entries[keyStr] = entry
+			count++
+		}
+		return true
+	})
+
+	if count == 0 {
+		// Если нет актуальных записей, удаляем файл
+		if _, err := os.Stat(cachePersistFile); err == nil {
+			os.Remove(cachePersistFile)
+			log.Printf("🗑️  Файл кеша удален (нет актуальных записей)")
+		}
+		return nil
+	}
+
+	// Кодируем в gob
+	var gobBuf bytes.Buffer
+	encoder := gob.NewEncoder(&gobBuf)
+	if err := encoder.Encode(snapshot); err != nil {
+		return err
+	}
+
+	// Сжимаем с помощью gzip (используем существующую функцию)
+	gzipData, err := compressGzip(gobBuf.Bytes())
+	if err != nil {
+		return err
+	}
+
+	// Сохраняем в файл
+	if err := os.WriteFile(cachePersistFile, gzipData, 0644); err != nil {
+		return err
+	}
+
+	log.Printf("💾 Кеш сохранен на диск: %d записей (gob: %d bytes, gzip: %d bytes)",
+		count, gobBuf.Len(), len(gzipData))
+	return nil
+}
+
+// loadCacheFromDisk загружает кеш из файла (gob + gzip)
+func loadCacheFromDisk() {
+	// Проверяем существование файла
+	if _, err := os.Stat(cachePersistFile); os.IsNotExist(err) {
+		log.Printf("📂 Файл кеша не найден: %s", cachePersistFile)
+		return
+	}
+
+	// Читаем файл
+	gzipData, err := os.ReadFile(cachePersistFile)
+	if err != nil {
+		log.Printf("⚠️  Ошибка чтения файла кеша: %v", err)
+		return
+	}
+
+	// Распаковываем gzip (используем существующую функцию)
+	gobData, err := decompressGzip(gzipData)
+	if err != nil {
+		log.Printf("⚠️  Ошибка распаковки gzip: %v", err)
+		return
+	}
+
+	// Декодируем gob
+	var snapshot CacheSnapshot
+	decoder := gob.NewDecoder(bytes.NewReader(gobData))
+	if err := decoder.Decode(&snapshot); err != nil {
+		log.Printf("⚠️  Ошибка декодирования gob: %v", err)
+		return
+	}
+
+	// Загружаем записи
+	loaded := 0
+	expired := 0
+	now := time.Now()
+
+	for key, entry := range snapshot.Entries {
+		// Проверяем актуальность записи
+		if now.Before(entry.ExpiresAt) {
+			responseCache.Store(key, entry)
+			loaded++
+		} else {
+			expired++
+		}
+	}
+
+	// Восстанавливаем статистику
+	if loaded > 0 {
+		atomic.StoreInt64(&cacheHits, snapshot.CacheHits)
+		atomic.StoreInt64(&cacheMisses, snapshot.CacheMiss)
+	}
+
+	log.Printf("✅ Кеш восстановлен из файла: %s", cachePersistFile)
+	log.Printf("   Загружено записей: %d", loaded)
+	if expired > 0 {
+		log.Printf("   Пропущено устаревших: %d", expired)
+	}
+	log.Printf("   Сохранен: %s", snapshot.SavedAt.Format("2006-01-02 15:04:05"))
+	log.Printf("   Статистика: hits=%d, misses=%d", snapshot.CacheHits, snapshot.CacheMiss)
+	log.Printf("   Размер файла: gzip=%d bytes, распаковано gob=%d bytes", len(gzipData), len(gobData))
 }
