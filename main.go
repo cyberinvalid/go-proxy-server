@@ -92,9 +92,10 @@ type CacheEntry struct {
 
 // CacheSettings настройки кеширования
 type CacheSettings struct {
-	Enabled    bool
-	TTL        time.Duration
-	KeyHeaders []string // Дополнительные заголовки для ключа кеша
+	Enabled     bool
+	TTL         time.Duration
+	KeyHeaders  []string // Дополнительные заголовки для ключа кеша
+	URLPatterns []string // Паттерны URL для кеширования (с поддержкой wildcard *)
 }
 
 var config Config
@@ -259,6 +260,15 @@ func setupCacheSettings() {
 			cacheSettings.KeyHeaders[i] = strings.TrimSpace(cacheSettings.KeyHeaders[i])
 		}
 	}
+
+	// Читаем паттерны URL для кеширования
+	urlPatterns := os.Getenv("CACHE_URL_PATTERNS")
+	if urlPatterns != "" {
+		cacheSettings.URLPatterns = strings.Split(urlPatterns, ",")
+		for i := range cacheSettings.URLPatterns {
+			cacheSettings.URLPatterns[i] = strings.TrimSpace(cacheSettings.URLPatterns[i])
+		}
+	}
 }
 
 func printCacheSettings() {
@@ -269,6 +279,11 @@ func printCacheSettings() {
 		if len(cacheSettings.KeyHeaders) > 0 {
 			log.Printf("   Key Headers: %v", cacheSettings.KeyHeaders)
 		}
+		if len(cacheSettings.URLPatterns) > 0 {
+			log.Printf("   URL Patterns: %v", cacheSettings.URLPatterns)
+		} else {
+			log.Printf("   URL Patterns: все URL (паттерны не заданы)")
+		}
 	} else {
 		log.Printf("   Enabled: ❌")
 	}
@@ -278,6 +293,7 @@ func printCacheSettings() {
 	log.Printf("   - CACHE_TTL=30m - кешировать запросы на 30 минут")
 	log.Printf("   - CACHE_KEY_HEADERS=X-Ya-Dest-Url,X-Custom - учитывать заголовки в ключе кеша")
 	log.Printf("   - CACHE_FILE=cache.gob - путь к файлу для сохранения кеша (gob+gzip)")
+	log.Printf("   - CACHE_URL_PATTERNS=http://storage.mds.yandex.net/*,*.yandex.net/* - паттерны URL для кеширования")
 	log.Printf("")
 }
 
@@ -948,10 +964,12 @@ func bufferedProxyRequest(w http.ResponseWriter, r *http.Request, proxyURL *url.
 		}
 	}
 
-	// Сохраняем в кеш если включен
-	if cacheSettings.Enabled {
+	// Сохраняем в кеш если включен и URL соответствует паттернам
+	if cacheSettings.Enabled && shouldCacheURL(proxyURL.String()) {
 		cacheKey := generateCacheKey(r.Method, proxyURL.String(), r.Header)
 		cacheResponse(cacheKey, resp.StatusCode, resp.Header, responseBody, proxyURL.String())
+	} else if cacheSettings.Enabled && !shouldCacheURL(proxyURL.String()) {
+		log.Printf("⏭️  URL не соответствует паттернам кеширования: %s", proxyURL.String())
 	}
 
 	// Копируем заголовки ответа
@@ -1591,6 +1609,40 @@ func getCacheSize() int {
 		return true
 	})
 	return size
+}
+
+// matchURLPattern проверяет соответствие URL паттерну с поддержкой wildcard (*)
+func matchURLPattern(urlStr string, pattern string) bool {
+	// Экранируем специальные символы regex кроме *
+	pattern = regexp.QuoteMeta(pattern)
+	// Заменяем \* (экранированную звездочку) на .*
+	pattern = strings.ReplaceAll(pattern, "\\*", ".*")
+	// Добавляем ^ и $ для полного совпадения
+	pattern = "^" + pattern + "$"
+
+	matched, err := regexp.MatchString(pattern, urlStr)
+	if err != nil {
+		log.Printf("⚠️  Ошибка проверки паттерна '%s': %v", pattern, err)
+		return false
+	}
+	return matched
+}
+
+// shouldCacheURL проверяет, нужно ли кешировать данный URL
+func shouldCacheURL(urlStr string) bool {
+	// Если паттерны не заданы - кешируем все
+	if len(cacheSettings.URLPatterns) == 0 {
+		return true
+	}
+
+	// Проверяем соответствие хотя бы одному паттерну
+	for _, pattern := range cacheSettings.URLPatterns {
+		if matchURLPattern(urlStr, pattern) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // cachePersistenceWorker периодически сохраняет кеш на диск при изменениях
